@@ -1,253 +1,153 @@
-from pyspark.sql import functions as F
-import os
-import numpy as np
 import pandas as pd
-import re
-from pyspark.ml.classification import DecisionTreeClassificationModel
-from pyspark.mllib.evaluation import MulticlassMetrics
-from pyspark.sql import SparkSession
+import numpy as np
 
 
 class DecisionTreeAnalyser:
-    def __init__(self, model, feat_mapping):
-        self.model = model
-        self.feat_mapping = feat_mapping
-        self._set_nodes()
+    def __init__(self, nodes):
+        self.nodes = nodes
 
-    def _set_nodes(self):
-        # get tree from string
-        decisions_report = self.model.toDebugString.split('\n')[1:]
-        tree_as_list = [dec for dec in decisions_report][:-1]
-        self._check_tree_consistency(tree_as_list)
+    @classmethod
+    def from_spark(cls, tree):
+        # prepare arrays to be filled with nodes' info
+        n_nodes = tree.numNodes
+        node_depth = np.zeros(shape=n_nodes, dtype=np.int64)
+        feature_id = np.zeros(shape=n_nodes, dtype=np.int64)
+        split_thresh = np.zeros(shape=n_nodes, dtype=np.float)
+        node_imp = np.zeros(shape=n_nodes, dtype=np.float)
+        node_gain = np.zeros(shape=n_nodes, dtype=np.float)
+        node_pred = np.zeros(shape=n_nodes, dtype=np.float)
+        is_leaf = np.zeros(shape=n_nodes, dtype=bool)
+        walking_index = np.zeros(shape=n_nodes, dtype=np.int64)
+        is_left = np.zeros(shape=n_nodes, dtype=bool)
+        is_right = np.zeros(shape=n_nodes, dtype=bool)
+        left_child_index = -np.ones(shape=n_nodes, dtype=np.int64)
+        right_child_index = -np.ones(shape=n_nodes, dtype=np.int64)
+        parent_index = -np.ones(shape=n_nodes, dtype=np.int64)
 
-        # sort tree as list to assign node ids
-        indentations = list(map(self.indentation_level, tree_as_list))
-        index = list(range(len(tree_as_list)))
-        df = pd.DataFrame(list(zip(tree_as_list, indentations, index)), columns=['tree', 'level', 'index'])
-        df.sort_values(by=['level', 'index'], inplace=True)
-        tree_as_list = df['tree'].tolist()
-        indentations = df['level'].tolist()
-        index = df['index'].tolist()
+        # set initial conditions for the while loop
+        stack = [(tree._call_java('rootNode'), 0)]  # start with the root node id (0) and its depth (0)
+        n = 0
+        while len(stack) > 0:  # cycle over the nodes, starting from the root node
+            # `pop` ensures each node is only visited once
+            node, depth = stack.pop(0)
+            if node.numDescendants() != 0:  # split node
 
-        # create pandas dataframe with node info from tree
-        # assign node ids and leaves' predictions
-        node_id = 0
-        ids = []
-        preds = []
-        for n, (row, level) in enumerate(zip(tree_as_list, indentations)):
-            if row.strip().startswith('If'):
-                ids.append(node_id)
-                preds.append(None)
-                node_id += 1
-            elif row.strip().startswith('Else'):
-                for j, l in enumerate(indentations[:n]):
-                    if l == level:
-                        try:
-                            ids[n] = ids[j]
-                        except IndexError:
-                            ids.append(ids[j])
-                            preds.append(None)
-            else:  # this is a leaf
-                ids.append(node_id)
-                preds.append(float(row.split('Predict:')[1]))
-                node_id += 1
+                # stack children nodes and increase depth
+                offset = len(stack)
+                stack.append((node.leftChild(), depth + 1))
+                stack.append((node.rightChild(), depth + 1))
 
-        # sort back again
-        df = pd.DataFrame(list(zip(tree_as_list, ids, indentations, index, preds)),
-                          columns=['tree', 'ids', 'level', 'index', 'preds'])
-        df.sort_values(by='index', inplace=True)
-        tree_as_list = df['tree'].tolist()
-        indentations = df['level'].tolist()
-        ids = df['ids'].tolist()
-        preds = df['preds'].tolist()
+                # fill info for this node and its children
+                walking_index[n] = n
+                left_child_index[n] = offset + n + 1
+                right_child_index[n] = offset + n + 2
+                is_left[offset + n + 1] = True
+                is_right[offset + n + 1] = False
+                is_left[offset + n + 2] = False
+                is_right[offset + n + 2] = True
+                parent_index[offset + n + 1] = n
+                parent_index[offset + n + 2] = n
+                feature_id[n] = node.split().featureIndex()
+                split_thresh[n] = node.split().threshold()
+                node_imp[n] = node.impurity()
+                node_gain[n] = node.gain()
+                node_pred[n] = -1
+                is_leaf[n] = False
+            else:  # leaf node
+                # fill info for this node
+                walking_index[n] = n
+                feature_id[n] = -1
+                split_thresh[n] = -1
+                node_imp[n] = -1
+                node_pred[n] = node.prediction()
+                is_leaf[n] = True
 
-        # assign children of nodes
-        children = []
-        for k, l1 in enumerate(indentations):
-            found_left = False
-            for j, l2 in enumerate(indentations[k:]):
-                if l2 == (l1 + 1):
-                    children.append(ids[k + j])
-                    found_left = True
-                    break
-            if not found_left:
-                children.append(-1)
+            node_depth[n] = depth
+            n = n + 1
 
-        # create data frame
-        df = pd.DataFrame(
-            {'row': tree_as_list, 'level': indentations, 'node_id': ids, 'children': children, 'leaf_pred': preds})
-        # small correction to compensate the for-loop used to calculate children
-        df.loc[df['row'].str.strip().str.startswith('Predict'), 'children'] = -1
+        nodes = pd.DataFrame(
+            list(zip(node_depth, feature_id, split_thresh, node_gain,
+                     node_imp, node_pred, is_leaf, is_left, is_right, parent_index,
+                     left_child_index, right_child_index)),
+            columns=["depth", "feature_index", "threshold", "gain",
+                     "impurity", "prediction", "is_leaf", "is_left", "is_right", "parent_index",
+                     "left_child_index", "right_child_index"]
+        )
+        nodes.index.name = "node_id"
+        return cls(nodes)
 
-        # calculate left and right children of nodes
-        df.sort_values(['node_id', 'level'], inplace=True)
-        df['l_child'] = df.groupby('node_id')['children'].transform("first")
-        df['r_child'] = df.groupby('node_id')['children'].transform("last")
-        df.drop('children', inplace=True, axis=1)
+    def decision_path(self, index):
+        path = []
+        found_path = False
+        parent_index = index
+        while not found_path:
+            if self.nodes.loc[parent_index, "parent_index"] == -1:
+                found_path = True
+                continue
+            parent_index = self.nodes.loc[parent_index, "parent_index"]
+            path.append(parent_index)
+        path = ([index] + path)[::-1]
+        return self.nodes.loc[path].copy()
 
-        # separate if...else expression
-        df['if'] = df.groupby('node_id')['row'].transform("first")
-        df['else'] = df.groupby('node_id')['row'].transform("last")
-        df.drop('row', inplace=True, axis=1)
-
-        # reset index to be a unique node id
-        df = df.set_index('node_id')
-        df = df[~df.index.duplicated(keep='first')]
-
-        # label leaves
-        df['leaf'] = False
-        df.loc[df['if'].str.strip().str.startswith('Predict'), 'leaf'] = True
-
-        # calculate the id of the feature used as condition for the node
-        df['feature_id'] = -1
-        mask = ~df['leaf']
-        df.loc[mask, 'feature_id'] = df.loc[mask, 'if'].str.extract(r'(\d+)')[0].astype(int)
-
-        self.nodes = df
-
-        self.leaves = self.nodes[self.nodes['leaf']].drop(['leaf', 'feature_id'], axis=1)
-        self._set_leaves_paths()
-        self._leaves_analysis()
-
-    def _set_leaves_paths(self, max_iterations=100):
-        for i, leaf in self.leaves.iterrows():
-            path = []
-            found_path = False
-            counter = 0
-            parent = self.nodes[self.nodes.index == leaf.name].copy()
-            while not found_path:
-                p1 = self.nodes[self.nodes["l_child"] == parent.index[0]].copy()
-                p2 = self.nodes[self.nodes["r_child"] == parent.index[0]].copy()
-                if len(p2) > len(p1):
-                    parent = p2
-                else:
-                    parent = p1
-                path.append(parent.iloc[0])
-
-                if parent.index[0] == 0:
-                    found_path = True
-
-                counter += 1
-                if counter == max_iterations:
-                    print("max iterations reached")
-                    break
-            path = path[::-1]
-            self.leaves.loc[leaf.name, 'parent_nodes'] = '//'.join([str(node.name) for node in path])
-            self.leaves.loc[leaf.name, 'parent_id'] = path[-1].name
-
-            conditions = []
-            for n, node in enumerate(path[:-1]):
-                if path[n + 1].name == node["l_child"]:
-                    conditions.append(self.statement_to_query(node["if"]))
-                elif path[n + 1].name == node["r_child"]:
-                    conditions.append(self.statement_to_query(node["else"]))
-            self.leaves.loc[leaf.name, 'decision_path'] = '//'.join(conditions)
-
-    def _leaves_analysis(self):
-        """Leaf analysis:
-        n_dn_features : number of dinamo features used for the decision
-        heterogeneity : number of unique features used for the decision
-        importance : for all the features used for the decision, sum of the feat. importance coefficients
-        polarity : absolute difference of the prediction of sibling leaves
-        """
-        imps = self.model.featureImportances
-        for i, leaf in self.leaves.iterrows():
-            node_ids = list(map(int, leaf["parent_nodes"].split('//')))
-            feat_ids = self.nodes.loc[node_ids, 'feature_id']
-            self.leaves.loc[i, "n_dn_features"] = sum([1 for i in feat_ids if "_dn_" in self.feat_mapping[i]])
-            self.leaves.loc[i, "heterogeneity"] = feat_ids.nunique()
-            self.leaves.loc[i, "depth"] = len(node_ids)
-            self.leaves.loc[i, "importance"] = sum([imps[i] for i in feat_ids.tolist()])
-            siblings = self.leaves[self.leaves["parent_nodes"] == leaf["parent_nodes"]]
-            if len(siblings) == 2:
-                self.leaves.loc[i, "polarity"] = abs(siblings["leaf_pred"].iloc[0] - siblings["leaf_pred"].iloc[1])
-
-    def get_leaf_counts(self, master, ids=None):
-        if ids is None:
-            ids = list(self.leaves.index)
-        mask = self.leaves.index.isin(ids)
-        relevant_nodes = [int(n) for n in set('//'.join(self.leaves.loc[mask, 'parent_nodes'].tolist()).split('//'))]
-
-        # create sub data column with subset of data based on the node decision
-        self.nodes.loc[0, 'sub_df'] = master
-        for i, node in self.nodes.iterrows():
-            if i in relevant_nodes:
-                if pd.isna(self.nodes.loc[node['l_child'], 'sub_df']):
-                    cond_if = self.statement_to_query(node['if'])
-                    cond_else = self.statement_to_query(node['else'])
-                    self.nodes.loc[node['l_child'], 'sub_df'] = self.nodes.loc[i, 'sub_df'].filter(cond_if)
-                    self.nodes.loc[node['r_child'], 'sub_df'] = self.nodes.loc[i, 'sub_df'].filter(cond_else)
-
-        leaf_counts = {}
-        for i, leaf in self.leaves.iterrows():
-            if i in ids:
-                leaf_counts[i] = self.nodes.loc[i, 'sub_df'].count()
-        return leaf_counts
-
-    def get_leaf_precision(self, master, label, ids=None):
-        if ids is None:
-            ids = list(self.leaves.index)
-        mask = self.leaves.index.isin(ids)
-        relevant_nodes = [int(n) for n in set('//'.join(self.leaves.loc[mask, 'parent_nodes'].tolist()).split('//'))]
-
-        # create sub data column with subset of data based on the node decision
-        self.nodes.loc[0, 'sub_df'] = master
-        for i, node in self.nodes.iterrows():
-            if i in relevant_nodes:
-                if pd.isna(self.nodes.loc[node['l_child'], 'sub_df']):
-                    cond_if = self.statement_to_query(node['if'])
-                    cond_else = self.statement_to_query(node['else'])
-                    self.nodes.loc[node['l_child'], 'sub_df'] = self.nodes.loc[i, 'sub_df'].filter(cond_if)
-                    self.nodes.loc[node['r_child'], 'sub_df'] = self.nodes.loc[i, 'sub_df'].filter(cond_else)
-
-        leaf_precision = {}
-        for i, leaf in self.leaves.iterrows():
-            if i in ids:
-                df = self.nodes.loc[i, 'sub_df']
-                metrics = MulticlassMetrics(df.select("label", "prediction").rdd.map(tuple))
-                try:
-                    leaf_precision[i] = metrics.precision(label)
-                except:
-                    leaf_precision[i] = None
-
-        return leaf_precision
-
-    def statement_to_query(self, st):
-        """ map if...else condition to a sql statement """
-        feat = re.findall(r'feature \d+', st)[0]
-        feat_name = self.feat_mapping[int(feat.replace('feature ', ''))]
-        if 'If' in st:
-            cond = st.strip().replace('If (', '').replace(')', '')
-            cond = re.sub(r'feature \d+', feat_name, cond)
-        elif 'Else' in st:
-            cond = st.strip().replace('Else (', '').replace(')', '')
-            cond = re.sub(r'feature \d+', feat_name, cond)
-        return cond
-
-    @staticmethod
-    def indentation_level(st, offset=2):
-        """Return leading spaces in a string"""
-        return len(st) - len(st.lstrip()) - offset
-
-    def _check_tree_consistency(self, tree):
-        # check if in the tree ifs are as many as elses
-        n_ifs = 0
-        n_els = 0
-        for row in tree:
-            if row.strip().startswith('If'):
-                n_ifs += 1
-            elif row.strip().startswith('Else'):
-                n_els += 1
-            elif row.strip().startswith('Predict'):
-                pass
+    def subtree(self, index):
+        def get_children(i):
+            node = self.nodes.loc[i]
+            if node["is_leaf"]:
+                return []
             else:
-                raise ValueError(row)
-        assert (n_ifs == n_els)
+                return self.nodes.loc[[node["left_child_index"], node["right_child_index"]]]
 
-    @property
-    def max_depth(self):
-        return self.nodes['level'].max()
+        subtree = []
+        children = get_children(index)
+        while len(children) > 0:
+            # select a child
+            child = children.iloc[0]
+            # save its name
+            subtree.append(child.name)
+            # get its children
+            new_children = get_children(child.name)
+            # drop the child
+            children = children.drop(child.name)
+            # append its children
+            children = children.append(new_children)
+        return self.nodes.loc[subtree].copy()
 
-    @property
-    def num_features(self):
-        return self.model.numFeatures
+    def decision_path_as_list(self, index):
+        def decision_as_str(i, feat_mapping=None):
+            # return the string with the last decision that led to the node
+            if i == 0:
+                return
+
+            parent = self.nodes.loc[self.nodes.loc[i, "parent_index"]]
+            feat_name = f'feature {parent["feature_index"]}' if feat_mapping is None else feat_mapping[
+                parent["feature_index"]]
+            symbol = '<=' if self.nodes.loc[i, "is_left"] else '>'
+            return f'{feat_name} {symbol} {parent["threshold"]}'
+
+        return [decision_as_str(i) for i in self.decision_path(index).index]
+
+    def path_properties(self):
+        # select leaves only
+        mask = self.nodes["is_leaf"]
+        df = self.nodes[mask].copy()
+
+        def count_unique_features(index):
+            """Count unique features that have been tested in the decision path that led to leaf n. `index`"""
+            x = self.decision_path(index)["feature_index"]
+            mask = x != -1
+            return x[mask].nunique()
+
+        def count_unique_predictions(index, level=1):
+            """Count unique predictions obtained in the subtree that originates from parent distant `level` from leaf n. `index`"""
+            # select grand parent of leaf based on `level`
+            grand_parent = self.nodes.loc[index]
+            for i in range(level):
+                grand_parent = self.nodes.loc[grand_parent["parent_index"]]
+
+            # get the subtree and count unique predictions
+            subtree = self.subtree(grand_parent.name)
+            return subtree.loc[subtree["is_leaf"], "prediction"].nunique()
+
+        df['nunique_features'] = df.index.to_series().apply(count_unique_features)
+        df['nunique_predictions'] = df.index.to_series().apply(count_unique_predictions)
+        return df[['depth', "nunique_features", "nunique_predictions", "prediction"]]
