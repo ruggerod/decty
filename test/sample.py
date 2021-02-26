@@ -5,6 +5,7 @@ import pandas as pd
 
 
 def get_iris_data():
+    """Return a training set for the pandas's iris dataset"""
     iris = load_iris()
     X = iris.data
     y = iris.target
