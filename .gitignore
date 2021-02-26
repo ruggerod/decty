@@ -3,3 +3,10 @@
 
 # notebooks
 *.ipynb
+
+# egg metadata
+*.egg-info
+.eggs
+
+# coverage
+.coverage

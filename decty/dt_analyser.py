@@ -132,13 +132,19 @@ class DecisionTreeAnalyser:
         df = self.nodes[mask].copy()
 
         def count_unique_features(index):
-            """Count unique features that have been tested in the decision path that led to leaf n. `index`"""
+            """
+            Count unique features that have been tested
+            in the decision path that led to leaf n. `index`
+            """
             x = self.decision_path(index)["feature_index"]
-            mask = x != -1
-            return x[mask].nunique()
+            msk = x != -1
+            return x[msk].nunique()
 
         def count_unique_predictions(index, level=1):
-            """Count unique predictions obtained in the subtree that originates from parent distant `level` from leaf n. `index`"""
+            """
+            Count unique predictions obtained in the subtree that
+            originates from parent distant `level` from leaf n. `index`
+            """
             # select grand parent of leaf based on `level`
             grand_parent = self.nodes.loc[index]
             for i in range(level):
