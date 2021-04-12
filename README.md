@@ -11,7 +11,7 @@ notebook presents a quick example of the additions that decty
 implements upon dtreeviz core functionalities.
 
 ## Install
-A [requirements](https://github.com/ruggerod/decty/requirements.txt) 
+A [requirements](https://github.com/ruggerod/decty/blob/main/requirements.txt) 
 file is provided to mimic the environment used during
 development. This environment should be build locally
 using the command `conda create --name <env> --file requirements.txt`. 
