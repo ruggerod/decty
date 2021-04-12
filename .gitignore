@@ -2,7 +2,8 @@
 .idea
 
 # notebooks
-*.ipynb
+.ipynb_checkpoints
+playground.ipynb
 
 # egg metadata
 *.egg-info
@@ -10,3 +11,6 @@
 
 # coverage
 .coverage
+
+# pytest
+.pytest_cache
